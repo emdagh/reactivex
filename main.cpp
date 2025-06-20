@@ -75,7 +75,13 @@ public:
 
 template <typename T>
 struct observer_impl {
-    
+    using fun_next     = std::function<void(const T&)>;
+    using fun_complete = std::function<void(void)>;
+    using fun_error    = std::function<void(std::exception_ptr)>;
+
+    fun_next on_next         = nullptr;
+    fun_complete on_complete = nullptr;
+    fun_error on_error       = nullptr;
 };
 
 
