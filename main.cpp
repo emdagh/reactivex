@@ -8,9 +8,10 @@
 #include <memory>
 #include <thread>
 #include <unordered_set>
+#include <mutex>
 
 #define DEBUG_METHOD() std::cout << __PRETTY_FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << ")" << std::endl
-
+#define DEBUG_INFO(...) std::cout << __VA_ARGS__ << std::endl
 using namespace std::literals;
 
 template <typename T> std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
@@ -23,19 +24,6 @@ namespace rx
 {
 
 template <typename Iterable> auto from_iterable(Iterable iterable);
-
-enum class retval : uint8_t
-{
-    kNext,
-    kComplete,
-    kError
-};
-
-std::ostream& operator<<(std::ostream& os, retval rv)
-{
-    os << static_cast<int>(rv);
-    return os;
-}
 
 template <class C, class V> auto append(C& container, V&& value, int) -> decltype(container.push_back(std::forward<V>(value)), void())
 {
@@ -56,22 +44,26 @@ template <typename, typename = void> constexpr bool is_iterable{};
 
 template <typename T> constexpr bool is_iterable<T, std::void_t<decltype(std::declval<T>().begin()), decltype(std::declval<T>().end())>> = true;
 
-struct subscription
+class subscription
 {
     using unsubscribe_fun = std::function<void(void)>;
     unsubscribe_fun _fun;
+public:
     subscription()
       : _fun(nullptr)
     {
     }
+    
     subscription(unsubscribe_fun&& fun)
-      : _fun(std::forward<unsubscribe_fun>(fun))
+      : _fun(std::move(fun))
     {
     }
+    
     virtual ~subscription()
     {
         unsubscribe();
     }
+    
     void unsubscribe()
     {
         if(_fun != nullptr)
@@ -79,6 +71,11 @@ struct subscription
             _fun();
         }
     }
+};
+
+template <typename T>
+struct observer_impl {
+    
 };
 
 
@@ -91,12 +88,13 @@ template <typename T> struct observer
     fun_next on_next         = nullptr;
     fun_complete on_complete = nullptr;
     fun_error on_error       = nullptr;
-
-    mutable bool is_complete = false;
+    
+public:
+    
 
     void next(const T& value) const
     {
-        if(on_next != nullptr && !is_complete)
+        if(on_next != nullptr)
         {
              on_next(value);
         }
@@ -104,12 +102,13 @@ template <typename T> struct observer
 
     void complete() const
     {
-        if(on_complete != nullptr && !is_complete)
+        if(on_complete != nullptr)
         {
             on_complete();
         }
-        is_complete = true;
     }
+
+    void error(std::exception_ptr ep) const {}
 };
 
 template <typename T> class observable
@@ -118,7 +117,7 @@ template <typename T> class observable
     subscribe_fun _fun;
 
 public:
-    observable(subscribe_fun fun)
+    observable(subscribe_fun&& fun)
       : _fun(std::move(fun))
     {
     }
@@ -128,33 +127,51 @@ public:
 
     virtual subscription subscribe(const observer<T>& obs)
     {
+        //observer<T> obs(std::move(impl));
         auto ret = _fun(obs);
         obs.complete();
         return ret;
     }
 
-    template <typename F> auto map(F&& fun)
-    {
-        DEBUG_METHOD();
-        return observable<T>([&](const observer<T>& obs) {
-            return this->subscribe({.on_next = [&](const T& t) {
-                return obs.next(fun(t));
-            }});
+    template <typename F, typename U = std::invoke_result_t<F,T>> 
+    auto map(F&& fun) {
+    
+        return observable<U>([&](const observer<U>& obs) {
+            return this->subscribe({
+                .on_next = [&](const T& t) {
+                    return obs.next(fun(t));
+                }
+            });
         });
     }
-    template <typename F> auto reduce(F&& fun, T seed = T{0})
+    template <typename F, typename U = std::invoke_result_t<F, T, T>> 
+    auto reduce(F&& fun, T seed = T{0})
     {
-        return observable<T>([this, fun, seed](const observer<T>& obs) {
-            T result = seed;
-            return this->subscribe({.on_next =
-                                        [&](const T& value) {
-                                            result = fun(result, value);
-                                            //return retval::kNext;
-                                        },
-                                    .on_complete =
-                                        [&] {
-                                            obs.next(result);
-                                        }});
+        return observable<U>([this, fun = std::forward<F>(fun), seed](const observer<U>& obs) -> subscription{
+            
+            struct reduce_state {
+                U current;
+                std::mutex mx;
+
+            reduce_state(U seed) : current(seed) {}
+            };
+            
+            auto state = std::make_shared<reduce_state> (seed); // make async compatible (no real way around heap here...)
+            
+            return this->subscribe({
+                .on_next = [&, state](const T& value) {
+                    std::lock_guard<std::mutex> lock(state->mx);
+                    state->current = fun(state->current, value);
+                },
+                .on_complete = [&, state] {
+                    std::lock_guard<std::mutex> lock(state->mx);
+                    obs.next(state->current);
+                    obs.complete();
+                },
+                .on_error = [&] (const std::exception_ptr ep) {
+                    obs.error(ep);
+                }
+            });
         });
     }
 
@@ -171,26 +188,38 @@ public:
     {
         return observable<T>([this](const observer<T>& obs) {
             std::unordered_set<T> seen = {};
-            return this->subscribe({.on_next = [&](const T& value) {
-                if(seen.insert(value).second)
-                {
-                    obs.next(value);
+            return this->subscribe({
+                .on_next = [&](const T& value) {
+                    if(seen.insert(value).second)
+                    {
+                        obs.next(value);
+                    }
                 }
-                //return retval::kNext;
-            }});
+            });
         });
     }
 
     auto first()
     {
         return observable<T>([&] (const observer<T>& obs) {
+           bool has_taken_first = false;
             subscription sub = this->subscribe({
                 .on_next = [&] (const T& value) {
-                    obs.next(value);
-                    obs.complete();
-                    sub.unsubscribe();
+                    
+                    if(!has_taken_first) {
+                        has_taken_first = true;
+                        
+                        obs.next(value);
+                        obs.complete();
+                        sub.unsubscribe();
+                    }
                 },
+                .on_complete = [&] {
+                    obs.complete();  
+                }
             });
+
+            
             return sub;
         });
     }
@@ -199,16 +228,14 @@ public:
     {
         return observable<T>([this](const observer<T>& obs) {
             T last;
-            subscription sub;
-            this->subscribe({.on_next =
+            return this->subscribe({.on_next =
                                         [&](const T& value) {
                                             last = value;
                                         },
                                     .on_complete =
                                         [&] {
-                                            obs.next(last);                                            
+                                            obs.next(last);
                                         }});
-            return sub;
         });
     }
 
@@ -221,7 +248,6 @@ public:
                 {
                     return obs.next(value);
                 }
-                //return retval::kNext;
             }});
         });
     }
@@ -234,24 +260,20 @@ public:
             subscription sub;
             sub = this->subscribe({
             .on_next = [&](const T& value) {
-                obs.next(value);
-                if(--remain <= 0) {
-                    obs.complete();
-                    sub.unsubscribe();
-                }
-                /*if(remain > 0) {
+               
+                if(remain > 0) {
                     obs.next(value);
-                
+               
                     remain--;
                     if(remain == 0) {
                        obs.complete();
                        sub.unsubscribe();
                     }
-                }*/
+                }
             },
                 .on_complete = [&] {
-                    obs.complete();   
-                }});
+                    obs.complete();  
+            }});
             return sub;
         });
     }
@@ -265,7 +287,6 @@ public:
             return this->subscribe({.on_next =
                                         [&obs, &buffer, key_for](const T& value) {
                                             buffer[key_for(value)].push_back(value);
-                                            return retval::kNext;
                                         },
                                     .on_complete =
                                         [&obs, &buffer] {
@@ -277,7 +298,8 @@ public:
         });
     }
 
-    template <typename Container, typename std::enable_if_t<is_iterable<Container>, bool> = true> auto to_iterable() const
+    template <typename Container, typename std::enable_if_t<is_iterable<Container>, bool> = true> 
+    auto to_iterable() const
     {
         return observable<Container>([this](const observer<Container>& obs) {
             Container res = {};
@@ -286,7 +308,6 @@ public:
             return this->subscribe({.on_next =
                                         [&o_first](const T& t) {
                                             *o_first++ = t;
-                                            return retval::kNext;
                                         },
                                     .on_complete =
                                         [&obs, &res] {
@@ -321,7 +342,6 @@ public:
                     return obs.next(value);
                 }
                 last_time = current_time;
-                return retval::kNext;
             }});
         });
     }
@@ -345,7 +365,6 @@ public:
                                                 when = now + duration;
                                                 return obs.next(inner);
                                             }
-                                            return retval::kNext;
                                         },
                                     .on_complete =
                                         [&] {
@@ -370,7 +389,6 @@ public:
                                                 buffer.clear();
                                                 return ret;
                                             }
-                                            return retval::kNext;
                                         },
                                     .on_complete =
                                         [&] {
@@ -411,7 +429,6 @@ template <typename... Ts> auto of(Ts&&... ts)
         for(auto i : list)
         {
             obs.next(i);
-            //if(obs.next(i) != retval::kNext)
             //{
             //    break;
             //}
@@ -425,11 +442,7 @@ template <typename T> auto range(T start, T count)
     return observable<T>([start, count](const observer<T>& obs) {
         for(T i = start; i < start + count; ++i)
         {
-            retval ret = obs.next(i);
-            if(ret != retval::kNext)
-            {
-                break;
-            }
+            obs.next(i);
         }
         return subscription{};
     });
@@ -442,10 +455,6 @@ template <typename Iterable> auto from_iterable(Iterable iterable)
         for(auto i : iterable)
         {
             obs.next(i);
-            //if(obs.next(i) != retval::kNext)
-            //{
-            //    break;
-            //}
         }
         return subscription{};
     });
@@ -456,50 +465,87 @@ template <typename Iterable> auto from_iterable(Iterable iterable)
 
 template <typename T>
 class subject
-  : public observable<T>
-  , public observer<T>
-{
-    std::vector<observer<T>> _sub;
+: public observable<T>
+, public observer<T> {
+    //std::unordered_map<observer<T>, bool> subscribers;
+    struct observer_context {
+        observer<T> obs;
+        bool is_active;
 
-    subscription int_subscribe(const observer<T>& obs)
-    {
-        _sub.push_back(obs);
-        std::cout << "[subscribe] obs=" << &obs << std::endl;
-        size_t ix = _sub.size() - 1;
+        explicit observer_context(observer<T> obs) : obs(std::move(obs)) {}
+    };
+    std::vector<observer_context> subscribers;
+    
+    std::mutex mtx;
+    bool is_terminated = false;
 
-        return subscription([this, &obs, ix] {
-            auto it = _sub.begin() + ix; // std::find(_sub.begin(), _sub.end(), obs);
-            if(it != _sub.end())
-            {
-                std::cout << "[unsubscribe] obs=" << &obs << std::endl;
-                _sub.erase(it);
-            }
+    void cleanup_inactive_subscribers() {
+        std::lock_guard<std::mutex> lock(mtx);
+        subscribers.erase(
+            std::remove_if(subscribers.begin(), subscribers.end(), 
+            [] (const auto& context) {
+                return !context.is_active;
+            }), subscribers.end()
+        );
+    }
+
+    subscription subscribe_impl(const observer<T>& obs) {
+        auto context = observer_context(obs);
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            subscribers.push_back(context);
+        }
+        return subscription([this, context] () mutable {
+            context.is_active = false; 
         });
     }
-
+    using pre_subscribe_hook = std::function<void(const observer<T>&)>;
 public:
-    subject(std::function<void(const observer<T>&)>&& pre = nullptr)
-      : observable<T>([this, pre = std::forward<decltype(pre)>(pre)](const observer<T>& obs) -> subscription {
-          if(pre != nullptr)
-          {
-              pre(obs);
-          }
-          return int_subscribe(obs);
-      })
+    explicit subject(pre_subscribe_hook&& hook = nullptr) 
+    : observable<T>([this, hook=std::forward<decltype(hook)>(hook)] (const observer<T>& obs) -> subscription {
+        if(hook) {
+            hook(obs);
+        }
+        return subscribe_impl(obs);
+    })
     {
+    
     }
 
-    virtual void next(const T& value)
-    {
-        DEBUG_METHOD();
-        for(auto& i : _sub)
-        {
-            i.next(value);
+    void next(const T& value) {
+        if(is_terminated) {
+            return;   
         }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            for(const auto& context : subscribers) {
+                if(context.is_active) {
+                    context.obs.next(value);
+                }
+            }
+        }
+        cleanup_inactive_subscribers();
+    }
+
+    void complete() {
+        if(is_terminated) {
+            return;   
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            for(auto& context : subscribers) {
+                if(context.is_active) {
+                    context.obs.complete();
+                    context.is_active = false;
+                }
+            }
+        }
+        subscribers.clear();
     }
 };
-
-template <typename T> class behavior_subject : public subject<T>
+    
+template <typename T> 
+class behavior_subject : public subject<T>
 {
     T _current;
     // std::vector<rx::observer<T>> _lst;
@@ -554,13 +600,39 @@ public:
         subject<T>::next(t);
     }
 };
+    template <typename T>
+    static observable<T> make_observable(std::function<subscription(const observer<T>&)> on_subscribe_func) {
+        return observable<T>(std::move(on_subscribe_func));
+    }
 } // namespace rx
 
 int main(int, char**) {
-    auto source = rx::of(1,2,3,4,5).subscribe({
-        .on_next = [] (int value) { std::cout << value << ","; return rx::retval::kNext;},
-        .on_complete = [] { std::cout << std::endl; } 
+    rx::subject<int> on_foo;
+    on_foo.subscribe( {
+        .on_next = [] (int n) { std::cout << n; },
+        .on_complete = [] { std::cout << std::endl; }
+    });
+    on_foo.next(10);
+    on_foo.complete();
+    
+    auto source = rx::of(1,2,3,3,4,5,6,6)
+        .distinct()
+        .map([] (int x) { return x * x; })
+        .reduce([] (int seed, int x) { return seed + x; })
+        .subscribe({
+            .on_next = [] (int value) { std::cout << value << ","; },
+            .on_complete = [] { std::cout << std::endl; }
+        });
+
+    rx::range(0,10)
+        .skip(3)
+        .take(5)
+        .subscribe({
+        .on_next = [] (int i) {
+            std::cout << i << ",";
+        },
+        .on_complete = [] { std::cout << std::endl; }
     });
     return 0;
-    
+   
 }
