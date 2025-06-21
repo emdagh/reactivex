@@ -1,4 +1,4 @@
- #include <cassert>
+#include <cassert>
 #include <chrono>
 #include <deque>
 #include <exception>
@@ -154,18 +154,25 @@ public:
 
     virtual subscription subscribe(const observer<T>& obs) 
     {
-        auto ret = _fun(obs);
-        obs.complete();
-        return ret;
+        return _fun(obs);
+        //auto ret = _fun(obs);
+        //obs.complete();
+        //return ret;
     }
 
     template <typename F, typename U = std::invoke_result_t<F,T>> 
     auto map(F&& fun) {
     
-        return observable<U>([&](const observer<U>& obs) {
+        return observable<U>([this, fun=std::forward<F>(fun)](const observer<U>& obs) {
             return this->subscribe({
-                .on_next = [&](const T& t) {
+                .on_next = [fun, obs](const T& t) {
                     return obs.next(fun(t));
+                },
+                .on_complete = [obs] { 
+                    obs.complete(); 
+                },
+                .on_error = [obs] (std::exception_ptr ep) {
+                    obs.error(ep);
                 }
             });
         });
@@ -215,11 +222,14 @@ public:
         return observable<T>([this](const observer<T>& obs) {
             std::unordered_set<T> seen = {};
             return this->subscribe({
-                .on_next = [&](const T& value) {
+                .on_next = [obs, &seen](const T& value) {
                     if(seen.insert(value).second)
                     {
                         obs.next(value);
                     }
+                },
+                .on_complete = [obs] {
+                    obs.complete();
                 }
             });
         });
@@ -280,7 +290,6 @@ public:
 
     auto take(size_t count)
     {
-        DEBUG_METHOD();
         return observable<T>([=](const observer<T>& obs) -> subscription {
             size_t remain = count;
             subscription sub;
@@ -455,10 +464,8 @@ template <typename... Ts> auto of(Ts&&... ts)
         for(auto i : list)
         {
             obs.next(i);
-            //{
-            //    break;
-            //}
         }
+        obs.complete();
         return subscription {};
     });
 }
@@ -470,6 +477,7 @@ template <typename T> auto range(T start, T count)
         {
             obs.next(i);
         }
+        obs.complete();
         return subscription{};
     });
 }
@@ -482,6 +490,7 @@ template <typename Iterable> auto from_iterable(Iterable iterable)
         {
             obs.next(i);
         }
+        obs.complete();
         return subscription{};
     });
 }
@@ -656,16 +665,30 @@ int main(int, char**) {
     on_foo.next(10);
     on_foo.complete();
 
-    auto fetchData = rx::make_observable<std::string>([](const observer<std::string>& obs) {
-    std::cout << "Making network request..." << std::endl; // Side effect
-    // Simulate async network call
-    std::thread([obs]() {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        obs.next("Data from server");
-        obs.complete();
-    }).detach();
-    return Subscription([]{ /* cleanup */ });
-});
+    auto fetchData = rx::make_observable<std::string>([](const rx::observer<std::string>& obs) {
+        std::cout << "Making network request..." << std::endl; // Side effect
+        // Simulate async network call
+        std::thread([obs]() {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            obs.next("Data from server");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            obs.next("Data from server");
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            obs.next("Data from server");
+            obs.complete();
+        }).detach();
+        return rx::subscription([]{ /* cleanup */ });
+    });
+
+    //fetchData
+    //    .map([] (const std::string& str) -> std::string { 
+    //        static int i = 0;
+    //        return str + " " + std::to_string(i++); 
+    //    }).subscribe({
+    //    .on_next = [] (const std::string& str) { std::cout << str << std::endl; }
+    //});
+    
+    std::this_thread::sleep_for(std::chrono::seconds(4));
     
     auto source = rx::of(1,2,3,3,4,5,6,6)
         .distinct()
