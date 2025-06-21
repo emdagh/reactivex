@@ -1,4 +1,4 @@
-#include <cassert>
+ #include <cassert>
 #include <chrono>
 #include <deque>
 #include <exception>
@@ -525,7 +525,10 @@ class subject
     }
 
     virtual subscription subscribe_impl(const observer<T>& obs) {
-        
+        if(is_terminated) {
+            obs.complete();
+            return subscription {};
+        }
         auto context = observer_context(obs);
         {
             std::lock_guard<std::mutex> lock(mtx);
@@ -585,9 +588,14 @@ class behavior_subject : public subject<T>
 {
     std::optional<T> _current;
     std::mutex _mtx;
+    bool _is_terminated = false;
     // std::vector<rx::observer<T>> _lst;
     virtual subscription subscribe_impl(const observer<T>& obs) override {
         std::lock_guard<std::mutex> lock(_mtx);
+        if(_is_terminated) {
+            obs.complete();
+            return subscription {};
+        }
         if(_current.has_value()) {
             obs.next(_current.value());
         }
@@ -622,6 +630,22 @@ template <typename T> class replay_subject : public subject<T>
 {
     size_t _len;
     std::deque<T> _q;
+    std::mutex _mtx;
+    bool _is_terminated = false;
+
+    subscription subscribe_impl(const observer<T>& obs) override {
+        std::lock_guard<std::mutex> lock(_mtx);
+        
+        for(auto& item : _q)
+        {
+            obs.next(item);
+        }
+        if(_is_terminated) {
+            obs.complete();
+            return subscription {};
+        }
+        return subject<T>::subscribe_impl(obs);
+    }
 
 public:
     replay_subject(size_t buf_len)
@@ -641,12 +665,15 @@ public:
 
     virtual void next(const T& t)
     {
-        DEBUG_METHOD();
-        _q.push_back(t);
-        if(_q.size() > _len)
         {
-            _q.pop_front();
+            std::lock_guard<std::mutex> lock(_mtx);
+            _q.push_back(t);
+            if(_q.size() > _len)
+            {
+                _q.pop_front();
+            }
         }
+        
         subject<T>::next(t);
     }
 };
@@ -688,7 +715,7 @@ int main(int, char**) {
     //    .on_next = [] (const std::string& str) { std::cout << str << std::endl; }
     //});
     
-    std::this_thread::sleep_for(std::chrono::seconds(4));
+    //std::this_thread::sleep_for(std::chrono::seconds(4));
     
     auto source = rx::of(1,2,3,3,4,5,6,6)
         .distinct()
