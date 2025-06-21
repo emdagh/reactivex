@@ -9,10 +9,18 @@
 #include <thread>
 #include <unordered_set>
 #include <mutex>
+#include <optional>
 
 #define DEBUG_METHOD() std::cout << __PRETTY_FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << ")" << std::endl
-#define DEBUG_INFO(...) std::cout << __VA_ARGS__ << std::endl
+#define DEBUG_INFO(...) print(std::cout, __VA_ARGS__)
 using namespace std::literals;
+
+template <typename Arg, typename... Args>
+void print(std::ostream& out, Arg&& arg, Args&&... args)
+{
+    out << std::forward<Arg>(arg);
+    ((out << ',' << std::forward<Args>(args)), ...);
+}
 
 template <typename T> std::ostream& operator<<(std::ostream& os, const std::vector<T>& v)
 {
@@ -87,34 +95,41 @@ struct observer_impl {
 
 template <typename T> struct observer
 {
-    using fun_next     = std::function<void(const T&)>;
-    using fun_complete = std::function<void(void)>;
-    using fun_error    = std::function<void(std::exception_ptr)>;
+    //using fun_next     = std::function<void(const T&)>;
+    //using fun_complete = std::function<void(void)>;
+    //using fun_error    = std::function<void(std::exception_ptr)>;
+//
+    //fun_next on_next         = nullptr;
+    //fun_complete on_complete = nullptr;
+    //fun_error on_error       = nullptr;
 
-    fun_next on_next         = nullptr;
-    fun_complete on_complete = nullptr;
-    fun_error on_error       = nullptr;
+    observer_impl<T> impl;
     
 public:
-    
+    explicit observer(const observer_impl<T>& impl) : impl(impl) {}
+    observer() : impl {} {}
 
     void next(const T& value) const
     {
-        if(on_next != nullptr)
+        if(impl.on_next != nullptr)
         {
-             on_next(value);
+             impl.on_next(value);
         }
     }
 
     void complete() const
     {
-        if(on_complete != nullptr)
+        if(impl.on_complete != nullptr)
         {
-            on_complete();
+            impl.on_complete();
         }
     }
 
-    void error(std::exception_ptr ep) const {}
+    void error(std::exception_ptr ep) const {
+        if(impl.on_error) {
+            impl.on_error(ep);
+        }
+    }
 };
 
 template <typename T> class observable
@@ -131,9 +146,14 @@ public:
     {
     }
 
-    virtual subscription subscribe(const observer<T>& obs)
+    virtual subscription subscribe(const observer_impl<T>& impl) 
     {
-        //observer<T> obs(std::move(impl));
+        observer<T> obs(impl);
+        return subscribe(obs);
+    }
+
+    virtual subscription subscribe(const observer<T>& obs) 
+    {
         auto ret = _fun(obs);
         obs.complete();
         return ret;
@@ -476,7 +496,7 @@ class subject
     //std::unordered_map<observer<T>, bool> subscribers;
     struct observer_context {
         observer<T> obs;
-        bool is_active;
+        bool is_active = true;
 
         explicit observer_context(observer<T> obs) : obs(std::move(obs)) {}
     };
@@ -495,7 +515,8 @@ class subject
         );
     }
 
-    subscription subscribe_impl(const observer<T>& obs) {
+    virtual subscription subscribe_impl(const observer<T>& obs) {
+        
         auto context = observer_context(obs);
         {
             std::lock_guard<std::mutex> lock(mtx);
@@ -518,7 +539,7 @@ public:
     
     }
 
-    void next(const T& value) {
+    virtual void next(const T& value) {
         if(is_terminated) {
             return;   
         }
@@ -553,24 +574,38 @@ public:
 template <typename T> 
 class behavior_subject : public subject<T>
 {
-    T _current;
+    std::optional<T> _current;
+    std::mutex _mtx;
     // std::vector<rx::observer<T>> _lst;
-
+    virtual subscription subscribe_impl(const observer<T>& obs) override {
+        std::lock_guard<std::mutex> lock(_mtx);
+        if(_current.has_value()) {
+            obs.next(_current.value());
+        }
+        return subject<T>::subscribe_impl(obs);
+    }
+    
 public:
     explicit behavior_subject(const T& t)
-      : subject<T>([this, t](const observer<T>& obs) {
-          obs.next(t);
-      })
-      , _current(t)
+      : subject<T>()
     {
+        _current = t;
     }
     virtual ~behavior_subject()
     {
     }
-    virtual void on_next(const T& t)
+    virtual void next(const T& t)
     {
-        _current = t;
+        {
+            std::lock_guard<std::mutex> lock(_mtx);
+            _current = t;
+        }
         subject<T>::next(t);
+    }
+
+    const std::optional<T>& get_value() const {
+        std::lock_guard<std::mutex> lock(_mtx);
+        return _current;
     }
 };
 
@@ -620,6 +655,17 @@ int main(int, char**) {
     });
     on_foo.next(10);
     on_foo.complete();
+
+    auto fetchData = rx::make_observable<std::string>([](const observer<std::string>& obs) {
+    std::cout << "Making network request..." << std::endl; // Side effect
+    // Simulate async network call
+    std::thread([obs]() {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        obs.next("Data from server");
+        obs.complete();
+    }).detach();
+    return Subscription([]{ /* cleanup */ });
+});
     
     auto source = rx::of(1,2,3,3,4,5,6,6)
         .distinct()
