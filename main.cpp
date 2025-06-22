@@ -56,6 +56,7 @@ class subscription
 {
     using unsubscribe_fun = std::function<void(void)>;
     unsubscribe_fun _fun;
+    bool _is_disposed = false;
 public:
     subscription()
       : _fun(nullptr)
@@ -74,10 +75,19 @@ public:
     
     void unsubscribe()
     {
-        if(_fun != nullptr)
+        if(_fun && !_is_disposed)
         {
             _fun();
+            _is_disposed = true;
         }
+    }
+
+    bool is_active() const {
+        return !_is_disposed;
+    }
+
+    bool is_disposed() const {
+        return !is_active();
     }
 };
 
@@ -92,24 +102,18 @@ struct observer_impl {
     fun_error on_error       = nullptr;
 };
 
-
 template <typename T> struct observer
 {
-    //using fun_next     = std::function<void(const T&)>;
-    //using fun_complete = std::function<void(void)>;
-    //using fun_error    = std::function<void(std::exception_ptr)>;
-//
-    //fun_next on_next         = nullptr;
-    //fun_complete on_complete = nullptr;
-    //fun_error on_error       = nullptr;
-
-    observer_impl<T> impl;
-    
+    observer_impl<T> impl;  
 public:
     explicit observer(const observer_impl<T>& impl) : impl(impl) {}
     observer() : impl {} {}
 
-    void next(const T& value) const
+    virtual void next(const T& value) {
+        return static_cast<const observer<T> &>(*this).next(value);
+    }
+    
+    void next(const T& value) const 
     {
         if(impl.on_next != nullptr)
         {
@@ -117,6 +121,15 @@ public:
         }
     }
 
+    template <typename... Ts>
+    void nexts(Ts&&... ts) const {
+       (next(std::forward<Ts>(ts)), ...);
+    }
+
+    virtual void complete() {
+        return static_cast<const observer<T> &>(*this).complete();
+    }
+    
     void complete() const
     {
         if(impl.on_complete != nullptr)
@@ -130,13 +143,16 @@ public:
             impl.on_error(ep);
         }
     }
+
+    virtual void error(std::exception_ptr ep) {
+        return static_cast<const observer<T> &>(*this).error(ep);
+    }
 };
 
 template <typename T> class observable
 {
     using subscribe_fun = std::function<subscription(const observer<T>&)>;
     subscribe_fun _fun;
-
 public:
     observable(subscribe_fun&& fun)
       : _fun(std::move(fun))
@@ -155,9 +171,6 @@ public:
     virtual subscription subscribe(const observer<T>& obs) 
     {
         return _fun(obs);
-        //auto ret = _fun(obs);
-        //obs.complete();
-        //return ret;
     }
 
     template <typename F, typename U = std::invoke_result_t<F,T>> 
@@ -192,16 +205,16 @@ public:
             auto state = std::make_shared<reduce_state> (seed); // make async compatible (no real way around heap here...)
             
             return this->subscribe({
-                .on_next = [&, state](const T& value) {
+                .on_next = [obs,state,fun](const T& value) {
                     std::lock_guard<std::mutex> lock(state->mx);
                     state->current = fun(state->current, value);
                 },
-                .on_complete = [&, state] {
+                .on_complete = [obs,state,fun] {
                     std::lock_guard<std::mutex> lock(state->mx);
                     obs.next(state->current);
                     obs.complete();
                 },
-                .on_error = [&] (const std::exception_ptr ep) {
+                .on_error = [obs, state] (const std::exception_ptr ep) {
                     obs.error(ep);
                 }
             });
@@ -264,14 +277,30 @@ public:
     {
         return observable<T>([this](const observer<T>& obs) {
             T last;
-            return this->subscribe({.on_next =
-                                        [&](const T& value) {
-                                            last = value;
-                                        },
-                                    .on_complete =
-                                        [&] {
-                                            obs.next(last);
-                                        }});
+            struct last_state {
+                T value;
+                std::mutex mtx;
+                bool is_terminated;
+            };
+            auto state = std::make_shared<last_state>();
+            return this->subscribe({
+                .on_next = [state](const T& value) {
+                    std::lock_guard<std::mutex> lock(state->mtx);
+                    if(state->is_teminated) {
+                        return;
+                    }
+                    state.value = value;
+                },
+                .on_complete = [state, obs] {
+                    std::lock_guard<std::mutex> lock(state->mtx);
+                    if(state->is_terminated) {
+                        return;
+                    }
+                    state->is_terminated = true;
+                    obs.next(state->last);
+                    obs.complete();
+                }
+            });
         });
     }
 
@@ -320,7 +349,7 @@ public:
             std::unordered_map<T, U> buffer = {};
 
             return this->subscribe({.on_next =
-                                        [&obs, &buffer, key_for](const T& value) {
+                                        [obs, buffer, key_for](const T& value) {
                                             buffer[key_for(value)].push_back(value);
                                         },
                                     .on_complete =
@@ -365,19 +394,39 @@ public:
     template <typename Period> auto debounce(const Period& timeout)
     {
         using clock_t = std::chrono::steady_clock;
+        
         return observable<T>([this, timeout](const observer<T>& obs) {
+
+            struct debounce_state {
+                std::optional<T> last;
+                subscription timer;
+                std::mutex mtx;
+                bool is_terminated;
+            };
+
+            auto state = std::make_shared<debounce_state>();
+            
             auto last_time = clock_t::now();
-            return this->subscribe({.on_next = [&](const T& value) {
-                // when a new value comes in, check if the previous value
-                // arrived before the `timeout` if it didn't -> emit new
-                // value
-                auto current_time = clock_t::now();
-                if(current_time - last_time < timeout)
-                {
-                    return obs.next(value);
+            
+            return this->subscribe({
+                .on_next = [state, timeout, obs, &last_time](const T& value) {
+                    std::lock_guard<std::mutex> lock(state->mtx);
+                    if(state->is_terminated) {
+                        return;
+                    }
+                    state->last = value;
+                    
+                    // when a new value comes in, check if the previous value
+                    // arrived before the `timeout` if it didn't -> emit new
+                    // value
+                    auto current_time = clock_t::now();
+                    if(current_time - last_time < timeout)
+                    {
+                        return obs.next(value);
+                    }
+                    last_time = current_time;
                 }
-                last_time = current_time;
-            }});
+            });
         });
     }
 
@@ -523,7 +572,7 @@ class subject
             }), subscribers.end()
         );
     }
-
+protected:
     virtual subscription subscribe_impl(const observer<T>& obs) {
         if(is_terminated) {
             obs.complete();
@@ -551,7 +600,7 @@ public:
     
     }
 
-    virtual void next(const T& value) {
+    virtual void next(const T& value) override {
         if(is_terminated) {
             return;   
         }
@@ -632,6 +681,7 @@ template <typename T> class replay_subject : public subject<T>
     std::deque<T> _q;
     std::mutex _mtx;
     bool _is_terminated = false;
+    bool _is_completed = false;
 
     subscription subscribe_impl(const observer<T>& obs) override {
         std::lock_guard<std::mutex> lock(_mtx);
@@ -641,6 +691,9 @@ template <typename T> class replay_subject : public subject<T>
             obs.next(item);
         }
         if(_is_terminated) {
+            return subscription {};
+        }
+        else if(_is_completed) {
             obs.complete();
             return subscription {};
         }
@@ -649,12 +702,7 @@ template <typename T> class replay_subject : public subject<T>
 
 public:
     replay_subject(size_t buf_len)
-      : subject<T>([this](const observer<T>& obs) {
-          for(auto& item : _q)
-          {
-              obs.next(item);
-          }
-      })
+      : subject<T>()
       , _len(buf_len)
     {
     }
@@ -663,7 +711,7 @@ public:
     {
     }
 
-    virtual void next(const T& t)
+    virtual void next(const T& t) override
     {
         {
             std::lock_guard<std::mutex> lock(_mtx);
@@ -676,14 +724,71 @@ public:
         
         subject<T>::next(t);
     }
+    
+    void complete() override {
+        // Protect shared state
+        std::lock_guard<std::mutex> lock(_mtx);
+        if (_is_terminated) {
+          return;  
+        }  // Atomically set and check
+
+        _is_completed = true;
+        subject<T>::complete();             // Delegate to base Subject's complete method
+    }
 };
     template <typename T>
     static observable<T> make_observable(std::function<subscription(const observer<T>&)> on_subscribe_func) {
         return observable<T>(std::move(on_subscribe_func));
     }
+
+    struct scheduler {
+        virtual ~scheduler() = default;
+        virtual subscription schedule(std::function<void()>&&) = 0;
+        virtual subscription schedule(std::function<void()>&&, int) = 0;
+    };
+
+    class threadpool_scheduler : public scheduler {
+        struct task {
+            int execution_time;
+            std::function<void()> action;
+            bool is_cancelled;
+
+            bool operator > (const task& other) {
+                return execution_time > other.execution_time;
+            }
+        };
+    public:
+    };
 } // namespace rx
 
 int main(int, char**) {
+
+    rx::behavior_subject<int> bs(1338);
+    bs.subscribe({
+        .on_next = [](int n) {
+            std::cout<<n<<std::endl;
+        }
+    });
+    bs.next(1337);
+    bs.complete();
+
+    rx::replay_subject<int> rs(15);
+    rs.subscribe({
+        .on_next = [] (int n) { 
+            std::cout << "sub1, n=" << n <<std::endl; 
+        }
+    });
+    rs.next(1);
+    rs.next(2);
+    rs.next(3);
+    rs.complete();
+
+    rs.subscribe({
+        .on_next = [] (int n) { 
+            std::cout << "sub2, n=" << n <<std::endl; 
+        }
+    });
+    
     rx::subject<int> on_foo;
     on_foo.subscribe( {
         .on_next = [] (int n) { std::cout << n; },
@@ -707,13 +812,13 @@ int main(int, char**) {
         return rx::subscription([]{ /* cleanup */ });
     });
 
-    //fetchData
-    //    .map([] (const std::string& str) -> std::string { 
-    //        static int i = 0;
-    //        return str + " " + std::to_string(i++); 
-    //    }).subscribe({
-    //    .on_next = [] (const std::string& str) { std::cout << str << std::endl; }
-    //});
+    fetchData
+        .map([] (const std::string& str) -> std::string { 
+            static int i = 0;
+            return str + " " + std::to_string(i++); 
+        }).subscribe({
+        .on_next = [] (const std::string& str) { std::cout << str << std::endl; }
+    });
     
     //std::this_thread::sleep_for(std::chrono::seconds(4));
     
