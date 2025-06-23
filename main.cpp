@@ -233,15 +233,23 @@ public:
     auto distinct()
     {
         return observable<T>([this](const observer<T>& obs) {
-            std::unordered_set<T> seen = {};
+            struct distinct_state {
+                std::unordered_set<T> seen = {};
+                std::mutex mtx;
+            };
+            //std::unordered_set<T> seen = {};
+            auto state = std::make_shared<distinct_state>();
+            
             return this->subscribe({
-                .on_next = [obs, &seen](const T& value) {
-                    if(seen.insert(value).second)
+                .on_next = [obs, state](const T& value) {
+                    std::unique_lock<std::mutex> lock(state->mtx);
+                    if(state->seen.insert(value).second)
                     {
                         obs.next(value);
                     }
                 },
-                .on_complete = [obs] {
+                .on_complete = [obs,state] {
+                    std::unique_lock<std::mutex> lock(state->mtx);
                     obs.complete();
                 }
             });
@@ -323,25 +331,25 @@ public:
             size_t remain = count;
             subscription sub;
             sub = this->subscribe({
-            .on_next = [&](const T& value) {
-               
-                if(remain > 0) {
-                    obs.next(value);
-               
-                    remain--;
-                    if(remain == 0) {
-                       obs.complete();
-                       sub.unsubscribe();
+                .on_next = [&](const T& value) {
+                    if(remain > 0) {
+                        obs.next(value);
+                        remain--;
+                        if(remain == 0) {
+                           obs.complete();
+                           sub.unsubscribe();
+                        }
                     }
-                }
-            },
+                },
                 .on_complete = [&] {
                     obs.complete();  
-            }});
+                }
+            });
             return sub;
         });
     }
-    template <typename KeySelector> auto group_by(KeySelector key_for)
+    template <typename KeySelector> 
+    auto group_by(KeySelector key_for)
     {
         using U = std::vector<T>;
         using Y = observable<T>;
@@ -388,6 +396,24 @@ public:
             return this->subscribe({.on_next = [&](const T& t) {
                 return obs.next(t);
             }});
+        });
+    }
+
+    template <typename F>
+    auto filter(F&& pred) {
+        auto upstream = this;
+        
+        return observable<T>([upstream, pred=std::forward<F>(pred)] (const observer<T>& downstream) {
+            return upstream->subscribe({
+                .on_next = [pred, downstream] (const T& value) {
+                    if(pred(value)) {
+                        downstream.next(value);
+                    }
+                },
+                .on_complete = [downstream] {
+                    downstream.complete();
+                }
+            });             
         });
     }
 
@@ -797,28 +823,28 @@ int main(int, char**) {
     on_foo.next(10);
     on_foo.complete();
 
-    auto fetchData = rx::make_observable<std::string>([](const rx::observer<std::string>& obs) {
-        std::cout << "Making network request..." << std::endl; // Side effect
-        // Simulate async network call
-        std::thread([obs]() {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            obs.next("Data from server");
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            obs.next("Data from server");
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            obs.next("Data from server");
-            obs.complete();
-        }).detach();
-        return rx::subscription([]{ /* cleanup */ });
-    });
-
-    fetchData
-        .map([] (const std::string& str) -> std::string { 
-            static int i = 0;
-            return str + " " + std::to_string(i++); 
-        }).subscribe({
-        .on_next = [] (const std::string& str) { std::cout << str << std::endl; }
-    });
+    //auto fetchData = rx::make_observable<std::string>([](const rx::observer<std::string>& obs) {
+    //    std::cout << "Making network request..." << std::endl; // Side effect
+    //    // Simulate async network call
+    //    std::thread([obs]() {
+    //        std::this_thread::sleep_for(std::chrono::seconds(1));
+    //        obs.next("Data from server");
+    //        std::this_thread::sleep_for(std::chrono::seconds(1));
+    //        obs.next("Data from server");
+    //        std::this_thread::sleep_for(std::chrono::seconds(1));
+    //        obs.next("Data from server");
+    //        obs.complete();
+    //    }).detach();
+    //    return rx::subscription([]{ /* cleanup */ });
+    //});
+//
+    //fetchData
+    //    .map([] (const std::string& str) -> std::string { 
+    //        static int i = 0;
+    //        return str + " " + std::to_string(i++); 
+    //    }).subscribe({
+    //    .on_next = [] (const std::string& str) { std::cout << str << std::endl; }
+    //});
     
     //std::this_thread::sleep_for(std::chrono::seconds(4));
     
@@ -827,16 +853,17 @@ int main(int, char**) {
         .map([] (int x) { return x * x; })
         .reduce([] (int seed, int x) { return seed + x; })
         .subscribe({
-            .on_next = [] (int value) { std::cout << value << ","; },
+            .on_next = [] (int value) { std::cout << value << ";"; },
             .on_complete = [] { std::cout << std::endl; }
         });
 
     rx::range(0,10)
         .skip(3)
         .take(5)
+        .filter([] (int n) { return n & 1; })
         .subscribe({
         .on_next = [] (int i) {
-            std::cout << i << ",";
+            std::cout << "odd=" << i << ",";
         },
         .on_complete = [] { std::cout << std::endl; }
     });
