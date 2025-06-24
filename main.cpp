@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <optional>
+#include <map>
 
 #define DEBUG_METHOD() std::cout << __PRETTY_FUNCTION__ << "(" << __FILE__ << ":" << __LINE__ << ")" << std::endl
 #define DEBUG_INFO(...) print(std::cout, __VA_ARGS__)
@@ -256,6 +257,41 @@ public:
         });
     }
 
+    template <typename Compare>
+    auto distinct_until_changed(Compare&& compare) {
+        return observable<T>([this, compare=std::forward<Compare>(compare)] (const observer<T>& obs) {
+            struct distinct_until_changed_state {
+                std::optional<T> last;
+                std::mutex mtx;
+                bool is_terminated = false;
+            };
+
+            auto state = std::make_shared<distinct_until_changed_state>();
+
+            return this->subscribe({
+                .on_next = [state, compare, obs] (const T& value) {
+                    std::lock_guard<std::mutex> lock(state->mtx);
+                    if(state->is_terminated) {
+                        return;
+                    }
+                    if(!state->last.has_value() || !compare(state->last.value(), value)) {
+                        obs.next(value);
+                        state->last = value;
+                    }
+                },
+                .on_complete = [state,obs] {
+                    std::lock_guard<std::mutex> lock(state->mtx);
+                    state->is_terminated = true;
+                    obs.complete();
+                }
+            });
+        });
+    }
+
+    auto distinct_until_changed() {
+        return distinct_until_changed(std::equal_to<T>());
+    }
+
     auto first()
     {
         return observable<T>([&] (const observer<T>& obs) {
@@ -348,27 +384,8 @@ public:
             return sub;
         });
     }
-    template <typename KeySelector> 
-    auto group_by(KeySelector key_for)
-    {
-        using U = std::vector<T>;
-        using Y = observable<T>;
-        return observable<Y>([this, key_for](const observer<Y>& obs) -> subscription {
-            std::unordered_map<T, U> buffer = {};
-
-            return this->subscribe({.on_next =
-                                        [obs, buffer, key_for](const T& value) {
-                                            buffer[key_for(value)].push_back(value);
-                                        },
-                                    .on_complete =
-                                        [&obs, &buffer] {
-                                            for(auto group : buffer)
-                                            {
-                                                obs.next(from_iterable(group.second));
-                                            }
-                                        }});
-        });
-    }
+    template <typename F, typename K = std::invoke_result_t<F,T>> 
+    auto group_by(F&& key_for);
 
     template <typename Container, typename std::enable_if_t<is_iterable<Container>, bool> = true> 
     auto to_iterable() const
@@ -511,6 +528,40 @@ public:
         });
     }
 };
+
+    template <typename T, typename K>
+    struct grouped_observable : public observable<T> {
+        using key_t = K;
+        key_t _key;
+
+        explicit grouped_observable(const key_t& key) : observable<T>(), _key(key) {}
+    
+
+        const key_t get_key() const {
+            return _key;
+        }
+    };
+
+    template <typename T>
+    template <typename F, typename K>
+    auto observable<T>::group_by(F&& fun) {
+        using shared_grouped_obaservable = std::shared_ptr<grouped_observable<T,K>>;
+        return observable<T>([this, fun=std::forward<F>(fun)] (const observer<T>& obs) {
+            struct group_by_state {
+                std::map<K, observable<T>> downstream;
+                std::mutex mtx;
+                bool is_terminated = false;
+            };
+            auto state = std::make_shared<group_by_state>();
+            return this->subscribe({
+                .on_next = [state, fun, obs] (const T& value) {
+                    if(state.is_terminated) return;
+                    K key  = fun(value);
+                    
+                }
+            });
+        });
+    }
 
 template <typename T, typename Traits = std::char_traits<T>> static auto from_istream(std::basic_istream<T, Traits>& iss)
 {
@@ -855,6 +906,14 @@ int main(int, char**) {
         .subscribe({
             .on_next = [] (int value) { std::cout << value << ";"; },
             .on_complete = [] { std::cout << std::endl; }
+        });
+
+    rx::of(1,1,2,2,2,3,4,5,5,6)
+        .distinct_until_changed()
+        .subscribe({
+            .on_next = [] (int value) {
+                std::cout << "changed: " << value << std::endl;
+            }
         });
 
     rx::range(0,10)
